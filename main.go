@@ -1,269 +1,480 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/gotd/td/examples"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/message"
-	"github.com/gotd/td/tg"
-	"go.uber.org/zap"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// Remnawave API types
+type CreateUserRequest struct {
+	Username          string   `json:"username"`
+	TrafficLimitBytes int64    `json:"trafficLimitBytes,omitempty"`
+	ExpireAt          string   `json:"expireAt,omitempty"`
+	TelegramID        int64    `json:"telegramId,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	Tag               string   `json:"tag,omitempty"`
+	HwidDeviceLimit   int      `json:"hwidDeviceLimit,omitempty"`
+	ActiveUserInbounds []InboundTag `json:"activeUserInbounds,omitempty"`
+}
+
+type InboundTag struct {
+	Tag string `json:"tag"`
+}
+
+type RemnawaveUser struct {
+	UUID             string `json:"uuid"`
+	Username         string `json:"username"`
+	ShortUUID        string `json:"shortUuid"`
+	SubscriptionUUID string `json:"subscriptionUuid"`
+	Status           string `json:"status"`
+	ShortURL         string `json:"subscriptionUrl"`
+}
+
+type RemnawaveResponse struct {
+	Response RemnawaveUser `json:"response"`
+}
+
+type InboundsResponse struct {
+	Response []Inbound `json:"response"`
+}
+
+type Inbound struct {
+	UUID string `json:"uuid"`
+	Tag  string `json:"tag"`
+	Type string `json:"type"`
+}
+
+// Bot state management
+type UserState struct {
+	Step       string
+	TrafficGB  int
+	DaysExpire int
+}
+
+var (
+	userStates = make(map[int64]*UserState)
+	statesMu   sync.Mutex
+
+	remnawaveAPI   string
+	remnawaveToken string
+	subDomain      string
+	botToken       string
+	adminIDs       map[int64]bool
+)
+
+func init() {
+	botToken = os.Getenv("BOT_TOKEN")
+	if botToken == "" {
+		log.Fatal("BOT_TOKEN is required")
+	}
+
+	remnawaveAPI = os.Getenv("REMNAWAVE_API")
+	if remnawaveAPI == "" {
+		remnawaveAPI = "http://127.0.0.1:3000"
+	}
+	remnawaveAPI = strings.TrimRight(remnawaveAPI, "/")
+
+	remnawaveToken = os.Getenv("REMNAWAVE_TOKEN")
+	if remnawaveToken == "" {
+		log.Fatal("REMNAWAVE_TOKEN is required")
+	}
+
+	subDomain = os.Getenv("SUB_DOMAIN")
+	if subDomain == "" {
+		subDomain = remnawaveAPI
+	}
+	subDomain = strings.TrimRight(subDomain, "/")
+
+	// Parse admin IDs (comma-separated)
+	adminIDs = make(map[int64]bool)
+	if ids := os.Getenv("ADMIN_IDS"); ids != "" {
+		for _, idStr := range strings.Split(ids, ",") {
+			id, err := strconv.ParseInt(strings.TrimSpace(idStr), 10, 64)
+			if err == nil {
+				adminIDs[id] = true
+			}
+		}
+	}
+}
+
+func isAdmin(userID int64) bool {
+	if len(adminIDs) == 0 {
+		return true // no restriction if no admins configured
+	}
+	return adminIDs[userID]
+}
+
 func main() {
-	// Environment variables:
-	//	BOT_TOKEN:     token from BotFather
-	// 	APP_ID:        app_id of Telegram app.
-	// 	APP_HASH:      app_hash of Telegram app.
-	// 	SESSION_FILE:  path to session file
-	// 	SESSION_DIR:   path to session directory, if SESSION_FILE is not set
-	examples.Run(func(ctx context.Context, log *zap.Logger) error {
-		// Dispatcher handles incoming updates.
-		dispatcher := tg.NewUpdateDispatcher()
-		opts := telegram.Options{
-			Logger:        log,
-			UpdateHandler: dispatcher,
-		}
-		return telegram.BotFromEnvironment(ctx, opts, func(ctx context.Context, client *telegram.Client) error {
-			// Raw MTProto API client, allows making raw RPC calls.
-			api := tg.NewClient(client)
-			// Helper for sending messages.
-			sender := message.NewSender(api)
-
-			// Setting up handler for incoming message.
-			dispatcher.OnNewMessage(func(ctx context.Context, entities tg.Entities, u *tg.UpdateNewMessage) error {
-				m, ok := u.Message.(*tg.Message)
-				if !ok || m.Out {
-					// Outgoing message, not interesting.
-					return nil
-				}
-				log.Info("Received message", zap.String("text", m.Message), zap.Any("peer", m.GetPeerID()))
-				// Проверяем команды для тегания всех участников
-				text := strings.TrimSpace(m.Message)
-				if text == "/tagall" || text == "/all" || text == "@all" {
-					return tagAllUsers(ctx, api, sender, entities, u, m)
-				}
-
-				return nil
-			})
-			return nil
-		}, telegram.RunUntilCanceled)
-	})
-}
-
-// tagAllUsers теги всех участников чата
-func tagAllUsers(ctx context.Context, api *tg.Client, sender *message.Sender, entities tg.Entities, u *tg.UpdateNewMessage, m *tg.Message) error {
-	// Получаем peer ID
-	peerID := m.GetPeerID()
-
-	// Проверяем тип чата и получаем участников
-	switch peer := peerID.(type) {
-	case *tg.PeerChat:
-		// Обычная группа
-		return tagUsersInChat(ctx, api, sender, entities, u, peer.ChatID)
-	case *tg.PeerChannel:
-		// Супергруппа или канал
-		return tagUsersInSupergroup(ctx, api, sender, entities, u, peer.ChannelID)
-	case *tg.PeerUser:
-		// Личные сообщения - команда не работает
-		_, err := sender.Reply(entities, u).Text(ctx, "Эта команда работает только в групповых чатах!")
-		return err
-	}
-
-	return nil
-}
-
-// tagUsersInChat теги участников в обычной группе
-func tagUsersInChat(ctx context.Context, api *tg.Client, sender *message.Sender, entities tg.Entities, u *tg.UpdateNewMessage, chatID int64) error {
-	// Получаем полную информацию о чате
-	fullChat, err := api.MessagesGetFullChat(ctx, chatID)
+	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
-		return err
+		log.Fatalf("Failed to create bot: %v", err)
 	}
 
-	chatFull, ok := fullChat.FullChat.(*tg.ChatFull)
-	if !ok {
-		return fmt.Errorf("unexpected chat type")
-	}
+	log.Printf("Bot started: @%s", bot.Self.UserName)
 
-	// Получаем участников
-	participants, ok := chatFull.Participants.(*tg.ChatParticipants)
-	if !ok {
-		return fmt.Errorf("unexpected participants type")
-	}
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+	updates := bot.GetUpdatesChan(u)
 
-	// Собираем всех пользователей
-	var mentions []string
-	for _, participant := range participants.Participants {
-		var userID int64
-
-		switch p := participant.(type) {
-		case *tg.ChatParticipant:
-			userID = p.UserID
-		case *tg.ChatParticipantAdmin:
-			userID = p.UserID
-		case *tg.ChatParticipantCreator:
-			userID = p.UserID
-		default:
+	for update := range updates {
+		if update.CallbackQuery != nil {
+			handleCallback(bot, update.CallbackQuery)
 			continue
 		}
-
-		// Ищем пользователя в entities
-		if userEntity, ok := entities.Users[userID]; ok {
-			if !userEntity.Bot && !userEntity.Deleted {
-				username := getUserMention(userEntity)
-				if username != "" {
-					mentions = append(mentions, username)
-				}
-			}
-		}
-	}
-
-	return sendMentions(ctx, sender, entities, u, mentions)
-}
-
-// tagUsersInSupergroup теги участников в супергруппе
-func tagUsersInSupergroup(ctx context.Context, api *tg.Client, sender *message.Sender, entities tg.Entities, u *tg.UpdateNewMessage, channelID int64) error {
-	// Находим канал в entities для получения access_hash
-	var channel *tg.Channel
-	for _, chatEntity := range entities.Chats {
-		if ch, ok := chatEntity.AsNotEmpty(); ok {
-			if channel, ok := ch.(*tg.Channel); ok && channel.ID == channelID {
-				channel = ch.(*tg.Channel)
-				break
-			}
-		}
-	}
-
-	if channel == nil {
-		_, err := sender.Reply(entities, u).Text(ctx, "Не удалось получить информацию о чате.")
-		return err
-	}
-
-	// Получаем участников супергруппы
-	participants, err := api.ChannelsGetParticipants(ctx, &tg.ChannelsGetParticipantsRequest{
-		Channel: &tg.InputChannel{
-			ChannelID:  channel.ID,
-			AccessHash: channel.AccessHash,
-		},
-		Filter: &tg.ChannelParticipantsRecent{},
-		Offset: 0,
-		Limit:  200, // Максимум 200 участников за раз
-		Hash:   0,
-	})
-	if err != nil {
-		return err
-	}
-
-	channelParticipants, ok := participants.(*tg.ChannelsChannelParticipants)
-	if !ok {
-		return fmt.Errorf("unexpected participants type")
-	}
-
-	// Собираем всех пользователей
-	var mentions []string
-	for _, participant := range channelParticipants.Participants {
-		var userID int64
-
-		switch p := participant.(type) {
-		case *tg.ChannelParticipant:
-			userID = p.UserID
-		case *tg.ChannelParticipantSelf:
-			userID = p.UserID
-		case *tg.ChannelParticipantAdmin:
-			userID = p.UserID
-		case *tg.ChannelParticipantCreator:
-			userID = p.UserID
-		default:
+		if update.Message == nil {
 			continue
 		}
-
-		// Ищем пользователя в полученных участниках
-		for _, u := range channelParticipants.Users {
-			if usr, ok := u.(*tg.User); ok {
-				if usr.ID == userID && !usr.Bot && !usr.Deleted {
-					username := getUserMention(usr)
-					if username != "" {
-						mentions = append(mentions, username)
-					}
-					break
-				}
-			}
+		if update.Message.IsCommand() {
+			handleCommand(bot, update.Message)
+			continue
 		}
+		handleText(bot, update.Message)
 	}
-
-	return sendMentions(ctx, sender, entities, u, mentions)
 }
 
-// sendMentions отправляет сообщения с упоминаниями
-func sendMentions(ctx context.Context, sender *message.Sender, entities tg.Entities, u *tg.UpdateNewMessage, mentions []string) error {
-	if len(mentions) == 0 {
-		_, err := sender.Reply(entities, u).Text(ctx, "Не найдено активных участников для упоминания.")
-		return err
+func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	switch msg.Command() {
+	case "start":
+		sendMainMenu(bot, msg.Chat.ID)
+	}
+}
+
+func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("➕ Создать клиента", "create_client"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 Мои подписки", "my_subs"),
+		),
+	)
+
+	text := "🔐 *Панель управления VPN*\n\nВыберите действие:"
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
+	bot.Send(tgbotapi.NewCallback(cb.ID, ""))
+
+	userID := cb.From.ID
+	chatID := cb.Message.Chat.ID
+
+	if !isAdmin(userID) {
+		bot.Send(tgbotapi.NewMessage(chatID, "⛔ У вас нет доступа."))
+		return
 	}
 
-	// Разбиваем на части если слишком много участников
-	const maxMentionsPerMessage = 50
-	const maxMessageLength = 4000 // Лимит длины сообщения в Telegram
+	switch {
+	case cb.Data == "create_client":
+		handleCreateClient(bot, chatID, userID)
 
-	if len(mentions) <= maxMentionsPerMessage {
-		// Если участников немного, отправляем одним сообщением
-		text := "📢 Внимание всех участников:\n" + strings.Join(mentions, " ")
-		if len(text) <= maxMessageLength {
-			_, err := sender.Reply(entities, u).Text(ctx, text)
-			return err
-		}
+	case cb.Data == "my_subs":
+		handleMySubs(bot, chatID, userID)
+
+	case cb.Data == "main_menu":
+		sendMainMenu(bot, chatID)
+
+	case strings.HasPrefix(cb.Data, "traffic_"):
+		handleTrafficChoice(bot, chatID, userID, cb.Data)
+
+	case strings.HasPrefix(cb.Data, "expire_"):
+		handleExpireChoice(bot, chatID, userID, cb.Data)
+	}
+}
+
+func handleCreateClient(bot *tgbotapi.BotAPI, chatID, userID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("50 GB", "traffic_50"),
+			tgbotapi.NewInlineKeyboardButtonData("100 GB", "traffic_100"),
+			tgbotapi.NewInlineKeyboardButtonData("200 GB", "traffic_200"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("500 GB", "traffic_500"),
+			tgbotapi.NewInlineKeyboardButtonData("♾ Безлимит", "traffic_0"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "main_menu"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, "📊 *Выберите лимит трафика:*")
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+
+	statesMu.Lock()
+	userStates[userID] = &UserState{Step: "choosing_traffic"}
+	statesMu.Unlock()
+}
+
+func handleTrafficChoice(bot *tgbotapi.BotAPI, chatID, userID int64, data string) {
+	gb, _ := strconv.Atoi(strings.TrimPrefix(data, "traffic_"))
+
+	statesMu.Lock()
+	state, ok := userStates[userID]
+	if !ok {
+		state = &UserState{}
+		userStates[userID] = state
+	}
+	state.TrafficGB = gb
+	state.Step = "choosing_expire"
+	statesMu.Unlock()
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("7 дней", "expire_7"),
+			tgbotapi.NewInlineKeyboardButtonData("30 дней", "expire_30"),
+			tgbotapi.NewInlineKeyboardButtonData("90 дней", "expire_90"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("180 дней", "expire_180"),
+			tgbotapi.NewInlineKeyboardButtonData("365 дней", "expire_365"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "create_client"),
+		),
+	)
+
+	trafficText := "♾ Безлимит"
+	if gb > 0 {
+		trafficText = fmt.Sprintf("%d GB", gb)
 	}
 
-	// Отправляем по частям
-	for i := 0; i < len(mentions); i += maxMentionsPerMessage {
-		end := i + maxMentionsPerMessage
-		if end > len(mentions) {
-			end = len(mentions)
-		}
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("📊 Трафик: *%s*\n\n⏳ *Выберите срок действия:*", trafficText))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
 
-		batch := mentions[i:end]
-		text := fmt.Sprintf("📢 Внимание участников (%d-%d):\n%s",
-			i+1, end, strings.Join(batch, " "))
+func handleExpireChoice(bot *tgbotapi.BotAPI, chatID, userID int64, data string) {
+	days, _ := strconv.Atoi(strings.TrimPrefix(data, "expire_"))
 
-		// Проверяем длину сообщения
-		if len(text) > maxMessageLength {
-			// Если даже часть слишком длинная, уменьшаем размер батча
-			smallerBatch := batch[:len(batch)/2]
-			text = fmt.Sprintf("📢 Внимание участников:\n%s",
-				strings.Join(smallerBatch, " "))
-			i -= maxMentionsPerMessage / 2 // Корректируем индекс
-		}
+	statesMu.Lock()
+	state, ok := userStates[userID]
+	if !ok {
+		statesMu.Unlock()
+		sendMainMenu(bot, chatID)
+		return
+	}
+	state.DaysExpire = days
+	trafficGB := state.TrafficGB
+	delete(userStates, userID)
+	statesMu.Unlock()
 
-		_, err := sender.Reply(entities, u).Text(ctx, text)
+	// Send "creating..." message
+	waitMsg := tgbotapi.NewMessage(chatID, "⏳ Создаю клиента...")
+	bot.Send(waitMsg)
+
+	// Generate username
+	username := fmt.Sprintf("tg_%d_%d", userID, time.Now().Unix())
+
+	// Calculate expiry
+	expireAt := time.Now().AddDate(0, 0, days).UTC().Format(time.RFC3339)
+
+	// Get available inbounds
+	inbounds, err := getInbounds()
+	if err != nil {
+		log.Printf("Failed to get inbounds: %v", err)
+	}
+
+	var inboundTags []InboundTag
+	for _, inb := range inbounds {
+		inboundTags = append(inboundTags, InboundTag{Tag: inb.Tag})
+	}
+
+	// Create user request
+	req := CreateUserRequest{
+		Username:          username,
+		ExpireAt:          expireAt,
+		TelegramID:        userID,
+		Description:       fmt.Sprintf("Created by bot for TG user %d", userID),
+		ActiveUserInbounds: inboundTags,
+	}
+
+	if trafficGB > 0 {
+		req.TrafficLimitBytes = int64(trafficGB) * 1024 * 1024 * 1024
+	}
+
+	// Create user in Remnawave
+	user, err := createRemnawaveUser(req)
+	if err != nil {
+		errMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ Ошибка создания клиента:\n`%s`", err.Error()))
+		errMsg.ParseMode = "Markdown"
+		bot.Send(errMsg)
+		return
+	}
+
+	// Build subscription link
+	subLink := fmt.Sprintf("%s/api/sub/%s", subDomain, user.ShortUUID)
+
+	trafficText := "♾ Безлимит"
+	if trafficGB > 0 {
+		trafficText = fmt.Sprintf("%d GB", trafficGB)
+	}
+
+	resultText := fmt.Sprintf(
+		"✅ *Клиент создан!*\n\n"+
+			"👤 Имя: `%s`\n"+
+			"📊 Трафик: *%s*\n"+
+			"⏳ Срок: *%d дней*\n"+
+			"📅 Истекает: *%s*\n\n"+
+			"🔗 *Ссылка на подписку:*\n`%s`\n\n"+
+			"Скопируйте ссылку и вставьте в ваш VPN-клиент.",
+		user.Username,
+		trafficText,
+		days,
+		time.Now().AddDate(0, 0, days).Format("02.01.2006"),
+		subLink,
+	)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Главное меню", "main_menu"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, resultText)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func handleMySubs(bot *tgbotapi.BotAPI, chatID, userID int64) {
+	user, err := getUserByTelegramID(userID)
+	if err != nil {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("➕ Создать клиента", "create_client"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "main_menu"),
+			),
+		)
+		msg := tgbotapi.NewMessage(chatID, "📋 У вас пока нет подписок.")
+		msg.ReplyMarkup = keyboard
+		bot.Send(msg)
+		return
+	}
+
+	subLink := fmt.Sprintf("%s/api/sub/%s", subDomain, user.ShortUUID)
+
+	text := fmt.Sprintf(
+		"📋 *Ваша подписка:*\n\n"+
+			"👤 Имя: `%s`\n"+
+			"📊 Статус: *%s*\n\n"+
+			"🔗 *Ссылка:*\n`%s`",
+		user.Username,
+		user.Status,
+		subLink,
+	)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "main_menu"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func handleText(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	// No text input expected currently, redirect to menu
+	sendMainMenu(bot, msg.Chat.ID)
+}
+
+// Remnawave API calls
+
+func remnawaveRequest(method, path string, body interface{}) ([]byte, error) {
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		reqBody = bytes.NewReader(data)
 	}
 
-	return nil
+	req, err := http.NewRequest(method, remnawaveAPI+path, reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+remnawaveToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
 }
 
-// getUserMention возвращает упоминание пользователя
-func getUserMention(user *tg.User) string {
-	if user.Username != "" {
-		return "@" + user.Username
+func createRemnawaveUser(user CreateUserRequest) (*RemnawaveUser, error) {
+	data, err := remnawaveRequest("POST", "/api/users", user)
+	if err != nil {
+		return nil, err
 	}
 
-	// Если нет username, используем имя с ID для markdown-ссылки
-	name := user.FirstName
-	if user.LastName != "" {
-		name += " " + user.LastName
+	var resp RemnawaveResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Экранируем специальные символы для markdown
-	name = strings.ReplaceAll(name, "[", "\\[")
-	name = strings.ReplaceAll(name, "]", "\\]")
-	name = strings.ReplaceAll(name, "(", "\\(")
-	name = strings.ReplaceAll(name, ")", "\\)")
+	return &resp.Response, nil
+}
 
-	// Возвращаем текстовое упоминание с ID
-	return fmt.Sprintf("[%s](tg://user?id=%d)", name, user.ID)
+func getUserByTelegramID(telegramID int64) (*RemnawaveUser, error) {
+	data, err := remnawaveRequest("GET", fmt.Sprintf("/api/users/by-telegram-id/%d", telegramID), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp RemnawaveResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &resp.Response, nil
+}
+
+func getInbounds() ([]Inbound, error) {
+	data, err := remnawaveRequest("GET", "/api/inbounds", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp InboundsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return resp.Response, nil
 }
