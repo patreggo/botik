@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -286,7 +287,7 @@ func handleExpireChoice(bot *tgbotapi.BotAPI, chatID, userID int64, data string)
 	state.Step = "entering_name"
 	statesMu.Unlock()
 
-	msg := tgbotapi.NewMessage(chatID, "✏️ *Введите имя для клиента:*\n\nНапример: `Иван` или `iPhone-Петя`")
+	msg := tgbotapi.NewMessage(chatID, "✏️ *Введите имя для клиента:*\n\nТолько латиница, цифры, дефис и подчёркивание.\nНапример: `Ivan` или `iPhone-Petya`")
 	msg.ParseMode = "Markdown"
 	bot.Send(msg)
 }
@@ -296,8 +297,8 @@ func finishClientCreation(bot *tgbotapi.BotAPI, chatID, userID int64, clientName
 	waitMsg := tgbotapi.NewMessage(chatID, "⏳ Создаю клиента...")
 	bot.Send(waitMsg)
 
-	// Generate username from client name
-	username := fmt.Sprintf("%s_%d", clientName, time.Now().Unix())
+	// Use client name directly as username
+	username := clientName
 
 	// Calculate expiry
 	expireAt := time.Now().AddDate(0, 0, days).UTC().Format(time.RFC3339)
@@ -447,8 +448,9 @@ func handleText(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	delete(userStates, userID)
 	statesMu.Unlock()
 
-	if clientName == "" {
-		m := tgbotapi.NewMessage(chatID, "❌ Имя не может быть пустым. Попробуйте ещё раз:")
+	validName := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	if clientName == "" || !validName.MatchString(clientName) {
+		m := tgbotapi.NewMessage(chatID, "❌ Имя должно содержать только латиницу, цифры, дефис или подчёркивание.\nПопробуйте ещё раз:")
 		bot.Send(m)
 		statesMu.Lock()
 		userStates[userID] = &UserState{Step: "entering_name", TrafficGB: trafficGB, DaysExpire: days}
