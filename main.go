@@ -321,7 +321,7 @@ func finishClientCreation(bot *tgbotapi.BotAPI, chatID, userID int64, clientName
 		log.Printf("Failed to get internal squads: %v", err)
 	} else {
 		for _, sq := range squads {
-			if strings.EqualFold(sq.Name, "default") || strings.EqualFold(sq.Name, "Default") {
+			if strings.EqualFold(sq.Name, "Default-Squad") || strings.EqualFold(sq.Name, "default") {
 				squadUUIDs = append(squadUUIDs, sq.UUID)
 				break
 			}
@@ -532,19 +532,56 @@ func getInternalSquads() ([]InternalSquad, error) {
 		return nil, err
 	}
 
+	log.Printf("Internal squads raw response: %s", string(data))
+
+	// Try parsing as {"response": [...]}
 	var resp InternalSquadsResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := json.Unmarshal(data, &resp); err == nil && len(resp.Response) > 0 {
+		return resp.Response, nil
+	}
+
+	// Try parsing as {"response": {"squads": [...]}} or similar nested object
+	var nested struct {
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(data, &nested); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	return resp.Response, nil
+	// Try array directly
+	var squads []InternalSquad
+	if err := json.Unmarshal(nested.Response, &squads); err == nil {
+		return squads, nil
+	}
+
+	// Try as object with various keys
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(nested.Response, &obj); err != nil {
+		return nil, fmt.Errorf("failed to parse squads response: raw=%s", string(data))
+	}
+
+	// Look for any array field
+	for _, v := range obj {
+		var arr []InternalSquad
+		if err := json.Unmarshal(v, &arr); err == nil && len(arr) > 0 {
+			return arr, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no squads found in response: %s", string(data))
 }
 
 func getInbounds() ([]Inbound, error) {
 	data, err := remnawaveRequest("GET", "/api/inbounds", nil)
 	if err != nil {
-		return nil, err
+		log.Printf("Failed /api/inbounds, trying /api/hosts: %v", err)
+		data, err = remnawaveRequest("GET", "/api/hosts", nil)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	log.Printf("Inbounds raw response: %s", string(data))
 
 	var resp InboundsResponse
 	if err := json.Unmarshal(data, &resp); err != nil {
