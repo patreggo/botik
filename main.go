@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,7 +26,8 @@ type CreateUserRequest struct {
 	Description       string   `json:"description,omitempty"`
 	Tag               string   `json:"tag,omitempty"`
 	HwidDeviceLimit   int      `json:"hwidDeviceLimit,omitempty"`
-	ActiveUserInbounds []InboundTag `json:"activeUserInbounds,omitempty"`
+	ActiveUserInbounds  []InboundTag `json:"activeUserInbounds,omitempty"`
+	ActiveInternalSquads []string    `json:"activeInternalSquads,omitempty"`
 }
 
 type InboundTag struct {
@@ -55,11 +57,21 @@ type Inbound struct {
 	Type string `json:"type"`
 }
 
+type InternalSquad struct {
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
+}
+
+type InternalSquadsResponse struct {
+	Response []InternalSquad `json:"response"`
+}
+
 // Bot state management
 type UserState struct {
 	Step       string
 	TrafficGB  int
 	DaysExpire int
+	ClientName string
 }
 
 var (
@@ -272,16 +284,21 @@ func handleExpireChoice(bot *tgbotapi.BotAPI, chatID, userID int64, data string)
 		return
 	}
 	state.DaysExpire = days
-	trafficGB := state.TrafficGB
-	delete(userStates, userID)
+	state.Step = "entering_name"
 	statesMu.Unlock()
 
+	msg := tgbotapi.NewMessage(chatID, "✏️ *Введите имя для клиента:*\n\nТолько латиница, цифры, дефис и подчёркивание.\nНапример: `Ivan` или `iPhone-Petya`")
+	msg.ParseMode = "Markdown"
+	bot.Send(msg)
+}
+
+func finishClientCreation(bot *tgbotapi.BotAPI, chatID, userID int64, clientName string, trafficGB, days int) {
 	// Send "creating..." message
 	waitMsg := tgbotapi.NewMessage(chatID, "⏳ Создаю клиента...")
 	bot.Send(waitMsg)
 
-	// Generate username
-	username := fmt.Sprintf("tg_%d_%d", userID, time.Now().Unix())
+	// Use client name directly as username
+	username := clientName
 
 	// Calculate expiry
 	expireAt := time.Now().AddDate(0, 0, days).UTC().Format(time.RFC3339)
@@ -297,13 +314,32 @@ func handleExpireChoice(bot *tgbotapi.BotAPI, chatID, userID int64, data string)
 		inboundTags = append(inboundTags, InboundTag{Tag: inb.Tag})
 	}
 
+	// Get default internal squad
+	var squadUUIDs []string
+	squads, err := getInternalSquads()
+	if err != nil {
+		log.Printf("Failed to get internal squads: %v", err)
+	} else {
+		for _, sq := range squads {
+			if strings.EqualFold(sq.Name, "default") || strings.EqualFold(sq.Name, "Default") {
+				squadUUIDs = append(squadUUIDs, sq.UUID)
+				break
+			}
+		}
+		// If no "Default" found, use the first squad
+		if len(squadUUIDs) == 0 && len(squads) > 0 {
+			squadUUIDs = append(squadUUIDs, squads[0].UUID)
+		}
+	}
+
 	// Create user request
 	req := CreateUserRequest{
-		Username:          username,
-		ExpireAt:          expireAt,
-		TelegramID:        userID,
-		Description:       fmt.Sprintf("Created by bot for TG user %d", userID),
-		ActiveUserInbounds: inboundTags,
+		Username:             username,
+		ExpireAt:             expireAt,
+		TelegramID:           userID,
+		Description:          fmt.Sprintf("Created by bot for TG user %d", userID),
+		ActiveUserInbounds:   inboundTags,
+		ActiveInternalSquads: squadUUIDs,
 	}
 
 	if trafficGB > 0 {
@@ -396,8 +432,33 @@ func handleMySubs(bot *tgbotapi.BotAPI, chatID, userID int64) {
 }
 
 func handleText(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	// No text input expected currently, redirect to menu
-	sendMainMenu(bot, msg.Chat.ID)
+	userID := msg.From.ID
+	chatID := msg.Chat.ID
+
+	statesMu.Lock()
+	state, ok := userStates[userID]
+	if !ok || state.Step != "entering_name" {
+		statesMu.Unlock()
+		sendMainMenu(bot, chatID)
+		return
+	}
+	trafficGB := state.TrafficGB
+	days := state.DaysExpire
+	clientName := strings.TrimSpace(msg.Text)
+	delete(userStates, userID)
+	statesMu.Unlock()
+
+	validName := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	if clientName == "" || !validName.MatchString(clientName) {
+		m := tgbotapi.NewMessage(chatID, "❌ Имя должно содержать только латиницу, цифры, дефис или подчёркивание.\nПопробуйте ещё раз:")
+		bot.Send(m)
+		statesMu.Lock()
+		userStates[userID] = &UserState{Step: "entering_name", TrafficGB: trafficGB, DaysExpire: days}
+		statesMu.Unlock()
+		return
+	}
+
+	finishClientCreation(bot, chatID, userID, clientName, trafficGB, days)
 }
 
 // Remnawave API calls
@@ -463,6 +524,20 @@ func getUserByTelegramID(telegramID int64) (*RemnawaveUser, error) {
 	}
 
 	return &resp.Response, nil
+}
+
+func getInternalSquads() ([]InternalSquad, error) {
+	data, err := remnawaveRequest("GET", "/api/internal-squads", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp InternalSquadsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return resp.Response, nil
 }
 
 func getInbounds() ([]Inbound, error) {
